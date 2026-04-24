@@ -7,6 +7,21 @@ const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 
 const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
 
+// ─── RETRY HELPER ─────────────────────────────────────────────────────────────
+// onRetry(err, attempt, defaultDelayMs) → optional custom delay in ms
+const withRetry = async (fn, { retries = 3, baseDelayMs = 1000, onRetry } = {}) => {
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (attempt === retries) throw err;
+      const defaultDelay = baseDelayMs * Math.pow(2, attempt);
+      const delay = onRetry ? (onRetry(err, attempt + 1, defaultDelay) ?? defaultDelay) : defaultDelay;
+      await sleep(delay);
+    }
+  }
+};
+
 // ─── FINGERPRINT / DEDUP HELPERS ──────────────────────────────────────────────
 const qFingerprint = (q) =>
   (q.question_text?.blocks || [])
@@ -257,27 +272,37 @@ class JobRunner extends EventEmitter {
     };
 
     try {
-      let res = await fetch(
-        `https://api.cloudinary.com/v1_1/${this.creds.cloudinaryCloudName}/image/upload`,
-        { method: "POST", body: buildForm(imageUrl) }
+      return await withRetry(
+        async () => {
+          let res = await fetch(
+            `https://api.cloudinary.com/v1_1/${this.creds.cloudinaryCloudName}/image/upload`,
+            { method: "POST", body: buildForm(imageUrl) }
+          );
+          let data = await res.json();
+
+          if (!data.secure_url) {
+            const imgRes = await fetch(imageUrl);
+            if (!imgRes.ok) throw new Error(`Download failed: ${imgRes.status}`);
+            const b64 = Buffer.from(await imgRes.arrayBuffer()).toString("base64");
+            const mimeType = imgRes.headers.get("content-type") || "image/png";
+            res = await fetch(
+              `https://api.cloudinary.com/v1_1/${this.creds.cloudinaryCloudName}/image/upload`,
+              { method: "POST", body: buildForm(`data:${mimeType};base64,${b64}`) }
+            );
+            data = await res.json();
+          }
+
+          if (!data.secure_url) throw new Error(`Upload failed: ${JSON.stringify(data)}`);
+          this.uploadCache.set(imageUrl, data.secure_url);
+          return data.secure_url;
+        },
+        {
+          retries: 2,
+          baseDelayMs: 2000,
+          onRetry: (err, attempt) =>
+            this.log(`Cloudinary retry ${attempt}/2 for ${imageUrl}: ${err.message}`),
+        }
       );
-      let data = await res.json();
-
-      if (!data.secure_url) {
-        const imgRes = await fetch(imageUrl);
-        if (!imgRes.ok) throw new Error(`Download failed: ${imgRes.status}`);
-        const b64 = Buffer.from(await imgRes.arrayBuffer()).toString("base64");
-        const mimeType = imgRes.headers.get("content-type") || "image/png";
-        res = await fetch(
-          `https://api.cloudinary.com/v1_1/${this.creds.cloudinaryCloudName}/image/upload`,
-          { method: "POST", body: buildForm(`data:${mimeType};base64,${b64}`) }
-        );
-        data = await res.json();
-      }
-
-      if (!data.secure_url) throw new Error(`Upload failed: ${JSON.stringify(data)}`);
-      this.uploadCache.set(imageUrl, data.secure_url);
-      return data.secure_url;
     } catch (err) {
       this.imageFailures.push({ url: imageUrl, reason: err.message });
       this.log(`Skipping image (${err.message}): ${imageUrl}`);
@@ -303,34 +328,48 @@ class JobRunner extends EventEmitter {
   }
 
   // ─── GEMINI ─────────────────────────────────────────────────────────────────
-  async callGemini(prompt, retries = 5) {
-    const response = await fetch(OPENROUTER_URL, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${this.creds.openrouterApiKey}`,
+  async callGemini(prompt) {
+    return withRetry(
+      async () => {
+        const response = await fetch(OPENROUTER_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${this.creds.openrouterApiKey}`,
+          },
+          body: JSON.stringify({
+            model: this.creds.geminiModel,
+            messages: [{ role: "user", content: prompt }],
+            temperature: 0.3,
+          }),
+        });
+        const data = await response.json();
+
+        if (data.error) {
+          const msg = data.error.message || JSON.stringify(data.error);
+          const rateLimitMatch = msg.match(/retry in ([\d.]+)s/i);
+          const err = new Error(msg);
+          if (rateLimitMatch) {
+            err.rateLimitMs = Math.ceil(parseFloat(rateLimitMatch[1]) * 1000) + 2000;
+          }
+          throw err;
+        }
+
+        return data.choices?.[0]?.message?.content?.trim() || null;
       },
-      body: JSON.stringify({
-        model: this.creds.geminiModel,
-        messages: [{ role: "user", content: prompt }],
-        temperature: 0.3,
-      }),
-    });
-    const data = await response.json();
-
-    if (data.error) {
-      const msg = data.error.message || JSON.stringify(data.error);
-      const retryMatch = msg.match(/retry in ([\d.]+)s/i);
-      if (retryMatch && retries > 0) {
-        const waitMs = Math.ceil(parseFloat(retryMatch[1]) * 1000) + 2000;
-        this.log(`Rate limited — waiting ${Math.ceil(waitMs / 1000)}s before retry...`);
-        await sleep(waitMs);
-        return this.callGemini(prompt, retries - 1);
+      {
+        retries: 5,
+        baseDelayMs: 3000,
+        onRetry: (err, attempt, defaultDelay) => {
+          if (err.rateLimitMs) {
+            this.log(`Rate limited — waiting ${Math.ceil(err.rateLimitMs / 1000)}s before retry (attempt ${attempt}/5)...`);
+            return err.rateLimitMs;
+          }
+          this.log(`Gemini error (attempt ${attempt}/5): ${err.message} — retrying in ${Math.ceil(defaultDelay / 1000)}s`);
+          return defaultDelay;
+        },
       }
-      throw new Error(msg);
-    }
-
-    return data.choices?.[0]?.message?.content?.trim() || null;
+    );
   }
 
   async enhanceExplanation(content, meta) {
@@ -485,13 +524,25 @@ ${text}`;
       if (this.cancelled) throw new Error("Cancelled");
 
       const url = urlMutator(this.job.link, page);
-      const response = await fetch(url, {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${this.creds.daricommaToken}`,
-          "Content-Type": "application/json",
+      const response = await withRetry(
+        async () => {
+          const res = await fetch(url, {
+            method: "GET",
+            headers: {
+              Authorization: `Bearer ${this.creds.daricommaToken}`,
+              "Content-Type": "application/json",
+            },
+          });
+          if (res.status >= 500) throw new Error(`HTTP ${res.status} on page ${page}`);
+          return res;
         },
-      });
+        {
+          retries: 3,
+          baseDelayMs: 2000,
+          onRetry: (err, attempt, delay) =>
+            this.log(`Page ${page} fetch failed (attempt ${attempt}/3): ${err.message} — retrying in ${Math.ceil(delay / 1000)}s`),
+        }
+      );
       if (!response.ok) throw new Error(`HTTP ${response.status} on page ${page}`);
 
       const data = await response.json();
@@ -551,14 +602,15 @@ ${text}`;
   }
 
   // ─── RUN ────────────────────────────────────────────────────────────────────
-  async run() {
-    const { meta, uploadImages, enhanceText } = this.job;
-
+  async fetchPhase() {
+    const { meta } = this.job;
     this.log(`Starting job for ${meta.class}/${meta.subject} — Chapter ${meta.chapter_no}`);
-
-    // Phase 1: fetch
     await this.fetchAllPages();
+    if (this.cancelled) throw new Error("Cancelled");
+  }
 
+  async postPhase() {
+    const { meta, uploadImages, enhanceText } = this.job;
     if (this.cancelled) throw new Error("Cancelled");
 
     // Phase 2: transform
@@ -693,6 +745,11 @@ ${text}`;
       imageFailures: this.imageFailures,
       aiFailures: this.aiFailures,
     };
+  }
+
+  async run() {
+    await this.fetchPhase();
+    return this.postPhase();
   }
 }
 
