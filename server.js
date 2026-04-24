@@ -149,7 +149,7 @@ app.post("/api/batches", async (req, res) => {
     createdAt: Date.now(),
     currentIndex: -1,
     cancelled: false,
-    currentRunner: null,
+    activeRunners: new Set(),
     jobs: jobs.map((j) => ({
       id: randomUUID(),
       link: j.link,
@@ -181,6 +181,7 @@ app.post("/api/batches", async (req, res) => {
 // ─── BATCH PROCESSOR ──────────────────────────────────────────────────────────
 const processBatch = async (batch) => {
   const creds = getCreds();
+  const pendingPosts = [];
 
   for (let i = 0; i < batch.jobs.length; i++) {
     if (batch.cancelled) break;
@@ -195,7 +196,7 @@ const processBatch = async (batch) => {
       creds,
       OUTPUT_ROOT
     );
-    batch.currentRunner = runner;
+    batch.activeRunners.add(runner);
 
     runner.on("log", (msg) => {
       const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
@@ -220,19 +221,40 @@ const processBatch = async (batch) => {
       });
     });
 
+    let fetchFailed = false;
     try {
-      const result = await runner.run();
-      job.result = result;
-      job.status = "done";
-      broadcast({ type: "job_update", batchId: batch.id, job: publicJob(job) });
+      await runner.fetchPhase();
     } catch (err) {
+      fetchFailed = true;
       job.error = err.message;
       job.status = err.message === "Cancelled" ? "cancelled" : "failed";
       broadcast({ type: "job_update", batchId: batch.id, job: publicJob(job) });
+      batch.activeRunners.delete(runner);
     }
 
-    batch.currentRunner = null;
+    if (!fetchFailed) {
+      // Post-processing runs in the background so the next job's fetch can start immediately.
+      const postPromise = runner
+        .postPhase()
+        .then((result) => {
+          job.result = result;
+          job.status = "done";
+          broadcast({ type: "job_update", batchId: batch.id, job: publicJob(job) });
+        })
+        .catch((err) => {
+          job.error = err.message;
+          job.status = err.message === "Cancelled" ? "cancelled" : "failed";
+          broadcast({ type: "job_update", batchId: batch.id, job: publicJob(job) });
+        })
+        .finally(() => {
+          batch.activeRunners.delete(runner);
+        });
+      pendingPosts.push(postPromise);
+    }
   }
+
+  // Wait for all background post-processing to finish before marking the batch done.
+  await Promise.all(pendingPosts);
 
   batch.status = batch.cancelled ? "cancelled" : "done";
   broadcast({ type: "batch_update", batch: publicBatch(batch) });
@@ -256,7 +278,7 @@ app.post("/api/batches/:id/cancel", (req, res) => {
   const batch = batches.get(req.params.id);
   if (!batch) return res.status(404).json({ error: "not found" });
   batch.cancelled = true;
-  if (batch.currentRunner) batch.currentRunner.cancel();
+  for (const runner of batch.activeRunners) runner.cancel();
   res.json({ ok: true });
 });
 
