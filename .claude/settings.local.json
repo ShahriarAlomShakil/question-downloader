@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(node -c downloader.js)",
+      "Bash(node -c server.js)",
+      "Bash(node --check public/app.js)",
+      "Bash(timeout 3 node server.js)"
+    ]
+  }
+}

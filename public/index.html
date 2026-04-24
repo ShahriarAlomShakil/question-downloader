@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Question Downloader</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">Question Downloader</div>
+      <div class="env-status" id="env-status">loading env…</div>
+    </header>
+
+    <main class="layout">
+      <!-- LEFT: Queue builder -->
+      <section class="panel">
+        <h2>Queue</h2>
+        <p class="hint">
+          Add one row per link. Each link saves to <code>CLASS/SUBJECT/CHAPTER N.json</code> (relative
+          to the project root). Defaults on the right pre-fill new rows.
+        </p>
+
+        <div class="defaults-card">
+          <div class="defaults-title">Defaults for new rows</div>
+          <div class="grid-2">
+            <label>Class<input id="def-class" value="HSC" /></label>
+            <label>Subject<input id="def-subject" value="Biology" /></label>
+            <label>Paper<input id="def-paper" value="1" /></label>
+            <label>Chapter #<input id="def-chapter_no" value="1" /></label>
+            <label class="span-2">Chapter name<input id="def-chapter_name" value="" /></label>
+          </div>
+          <div class="row-toggles">
+            <label><input type="checkbox" id="def-uploadImages" checked /> Upload images to Cloudinary</label>
+            <label><input type="checkbox" id="def-enhanceText" checked /> Enhance text with Gemini</label>
+          </div>
+        </div>
+
+        <div class="queue-actions">
+          <button id="add-row">+ Add link</button>
+          <button id="add-many">+ Paste many links</button>
+          <button id="clear-queue" class="ghost">Clear</button>
+        </div>
+
+        <table class="queue-table" id="queue-table">
+          <thead>
+            <tr>
+              <th style="width:30px">#</th>
+              <th>Link</th>
+              <th style="width:80px">Class</th>
+              <th style="width:110px">Subject</th>
+              <th style="width:60px">Paper</th>
+              <th style="width:60px">Ch #</th>
+              <th>Chapter name</th>
+              <th style="width:50px">IMG</th>
+              <th style="width:50px">AI</th>
+              <th style="width:30px"></th>
+            </tr>
+          </thead>
+          <tbody id="queue-body"></tbody>
+        </table>
+
+        <div class="start-row">
+          <button id="start-batch" class="primary">Start batch</button>
+          <button id="cancel-batch" class="danger" disabled>Cancel</button>
+          <span id="batch-status" class="batch-status"></span>
+        </div>
+      </section>
+
+      <!-- RIGHT: Live status -->
+      <section class="panel">
+        <h2>Status</h2>
+        <div id="jobs-list" class="jobs-list">
+          <div class="empty">No batch running. Add links and hit "Start batch".</div>
+        </div>
+      </section>
+    </main>
+
+    <!-- Detail modal -->
+    <div class="modal hidden" id="modal">
+      <div class="modal-body">
+        <button class="modal-close" id="modal-close">×</button>
+        <div id="modal-content"></div>
+      </div>
+    </div>
+
+    <!-- Paste-many modal -->
+    <div class="modal hidden" id="paste-modal">
+      <div class="modal-body">
+        <button class="modal-close" id="paste-close">×</button>
+        <h3>Paste multiple links (one per line)</h3>
+        <p class="hint">Each link will use the current defaults for class/subject/paper/chapter.</p>
+        <textarea id="paste-area" rows="10" placeholder="https://api.daricomma.com/..."></textarea>
+        <div class="start-row">
+          <button id="paste-apply" class="primary">Add to queue</button>
+        </div>
+      </div>
+    </div>
+
+    <template id="queue-row-template">
+      <tr>
+        <td class="row-num"></td>
+        <td><input class="q-link" placeholder="https://api.daricomma.com/..." /></td>
+        <td><input class="q-class" /></td>
+        <td><input class="q-subject" /></td>
+        <td><input class="q-paper" /></td>
+        <td><input class="q-chapter_no" /></td>
+        <td><input class="q-chapter_name" /></td>
+        <td class="center"><input type="checkbox" class="q-uploadImages" /></td>
+        <td class="center"><input type="checkbox" class="q-enhanceText" /></td>
+        <td><button class="q-del icon-btn">×</button></td>
+      </tr>
+    </template>
+
+    <script src="/app.js"></script>
+  </body>
+</html>
