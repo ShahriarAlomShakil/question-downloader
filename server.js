@@ -3,6 +3,7 @@ require("dotenv").config();
 const express = require("express");
 const path = require("path");
 const fs = require("fs");
+const os = require("os");
 const { randomUUID } = require("crypto");
 const { JobRunner } = require("./downloader");
 
@@ -11,7 +12,7 @@ app.use(express.json({ limit: "5mb" }));
 app.use(express.static(path.join(__dirname, "public")));
 
 const PORT = process.env.PORT || 3939;
-const OUTPUT_ROOT = path.resolve(__dirname, "..");
+const OUTPUT_ROOT = path.join(os.homedir(), "Downloads");
 
 // ─── CREDS FROM .env ──────────────────────────────────────────────────────────
 const getCreds = () => ({

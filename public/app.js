@@ -2,6 +2,7 @@
 let currentBatch = null; // batch object from server
 // jobId -> { index: liveRecord } — live per-question data for comparison views
 const jobRecords = new Map();
+let liveRecordSeq = 0;
 const STORAGE_KEY = "qdl-defaults-v1";
 const QUEUE_KEY = "qdl-queue-v1";
 
@@ -183,6 +184,35 @@ const cancelBatch = async () => {
   }
 };
 
+// ─── RAF DEBOUNCE ─────────────────────────────────────────────────────────────
+const _pendingCardRafs = new Map();
+const _pendingLQRafs = new Map();
+
+const scheduleCardRender = (jobId) => {
+  if (_pendingCardRafs.has(jobId)) return;
+  _pendingCardRafs.set(
+    jobId,
+    requestAnimationFrame(() => {
+      _pendingCardRafs.delete(jobId);
+      if (!currentBatch) return;
+      const job = currentBatch.jobs.find((j) => j.id === jobId);
+      const card = document.querySelector(`.job-card[data-job-id="${jobId}"]`);
+      if (job && card) renderJobCard(card, job, currentBatch.id);
+    })
+  );
+};
+
+const scheduleLQRender = (jobId, batchId) => {
+  if (_pendingLQRafs.has(jobId)) return;
+  _pendingLQRafs.set(
+    jobId,
+    requestAnimationFrame(() => {
+      _pendingLQRafs.delete(jobId);
+      renderLiveQuestions(jobId, batchId);
+    })
+  );
+};
+
 // ─── RENDER JOBS LIST ─────────────────────────────────────────────────────────
 const jobCard = (job, batchId) => {
   const card = document.createElement("div");
@@ -196,6 +226,9 @@ const progressCell = (label, value) =>
   `<div class="progress-cell"><div class="label">${label}</div><div class="value">${value}</div></div>`;
 
 const renderJobCard = (card, job, batchId) => {
+  // Preserve the live-questions element so it isn't wiped by innerHTML
+  const savedLQ = card.querySelector(`[data-job-live="${job.id}"]`);
+
   const p = job.progress || {};
   const fetchLine = p.total
     ? `${p.fetched || 0}/${p.total}`
@@ -205,7 +238,6 @@ const renderJobCard = (card, job, batchId) => {
   const transformLine = p.total || p.done !== undefined ? `${p.done || 0}/${p.total || "?"}` : "—";
   const geminiLine = p.total !== undefined && p.done !== undefined ? `${p.done}/${p.total}` : "—";
 
-  // Derive per-phase progress:
   const fetchDone = p.fetched && p.total ? Math.min(1, p.fetched / p.total) : 0;
 
   const chapterLabel = `${job.meta.class}/${job.meta.subject} — Ch${job.meta.chapter_no}${
@@ -256,7 +288,7 @@ const renderJobCard = (card, job, batchId) => {
     <div class="live-questions" data-job-live="${job.id}"></div>
     ${
       job.logs && job.logs.length
-        ? `<div class="logs">${job.logs.map((l) => `<div>${esc(l)}</div>`).join("")}</div>`
+        ? `<div class="logs">${[...job.logs].reverse().map((l) => `<div>${esc(l)}</div>`).join("")}</div>`
         : ""
     }
   `;
@@ -269,7 +301,13 @@ const renderJobCard = (card, job, batchId) => {
     });
   });
 
-  renderLiveQuestions(job.id, batchId);
+  // Restore the preserved live-questions element, or do an initial render
+  const lqSlot = card.querySelector(`[data-job-live="${job.id}"]`);
+  if (savedLQ && lqSlot) {
+    lqSlot.replaceWith(savedLQ);
+  } else {
+    scheduleLQRender(job.id, batchId);
+  }
 };
 
 // ─── LIVE QUESTIONS PANEL ─────────────────────────────────────────────────────
@@ -297,13 +335,18 @@ const contentPreview = (content, max = 100) => {
 const renderLiveQuestions = (jobId, batchId) => {
   const container = document.querySelector(`[data-job-live="${jobId}"]`);
   if (!container) return;
+
   const recMap = jobRecords.get(jobId);
   if (!recMap || recMap.size === 0) {
     container.innerHTML = "";
     return;
   }
 
-  const records = [...recMap.values()].sort((a, b) => a.index - b.index);
+  const records = [...recMap.values()].sort((a, b) => {
+    const orderDiff = (b._liveOrder || 0) - (a._liveOrder || 0);
+    if (orderDiff) return orderDiff;
+    return b.index - a.index;
+  });
   const rows = records
     .map((r) => {
       const phase = r.phase || "transformed";
@@ -337,6 +380,9 @@ const renderLiveQuestions = (jobId, batchId) => {
     <div class="lq-list">${rows}</div>
   `;
 
+  const nextList = container.querySelector(".lq-list");
+  if (nextList) nextList.scrollTop = 0;
+
   container.querySelectorAll(".lq-row").forEach((el) => {
     el.addEventListener("click", () => {
       const idx = parseInt(el.dataset.idx, 10);
@@ -352,8 +398,9 @@ const handleQuestionRecord = (data) => {
     bag = new Map();
     jobRecords.set(data.jobId, bag);
   }
+  data.record._liveOrder = ++liveRecordSeq;
   bag.set(data.record.index, data.record);
-  renderLiveQuestions(data.jobId, data.batchId);
+  scheduleLQRender(data.jobId, data.batchId);
 
   // Keep any open comparison modal in sync.
   if (comparisonState && comparisonState.jobId === data.jobId && comparisonState.index === data.record.index) {
@@ -361,15 +408,37 @@ const handleQuestionRecord = (data) => {
   }
 };
 
-const renderBatch = (batch) => {
+const renderBatch = (batch, forceRebuild = false) => {
+  for (const rafId of _pendingCardRafs.values()) cancelAnimationFrame(rafId);
+  _pendingCardRafs.clear();
   currentBatch = batch;
   const list = $("#jobs-list");
-  list.innerHTML = "";
+
   if (!batch || !batch.jobs.length) {
     list.innerHTML = `<div class="empty">No batch running.</div>`;
     return;
   }
-  for (const job of batch.jobs) list.appendChild(jobCard(job, batch.id));
+
+  const existingCards = new Map(
+    [...list.querySelectorAll(".job-card")].map((c) => [c.dataset.jobId, c])
+  );
+
+  if (forceRebuild || existingCards.size === 0) {
+    list.innerHTML = "";
+    for (const job of batch.jobs) list.appendChild(jobCard(job, batch.id));
+  } else {
+    // Update existing cards in-place (preserves live-questions DOM); add/remove as needed
+    for (const job of batch.jobs) {
+      const card = existingCards.get(job.id);
+      if (card) {
+        renderJobCard(card, job, batch.id);
+        existingCards.delete(job.id);
+      } else {
+        list.appendChild(jobCard(job, batch.id));
+      }
+    }
+    for (const stale of existingCards.values()) stale.remove();
+  }
 
   const doneStatuses = new Set(["done", "failed", "cancelled"]);
   const allDone = batch.jobs.every((j) => doneStatuses.has(j.status));
@@ -385,8 +454,7 @@ const updateJobInPlace = (jobId, mutator) => {
   const job = currentBatch.jobs.find((j) => j.id === jobId);
   if (!job) return;
   mutator(job);
-  const card = $(`.job-card[data-job-id="${jobId}"]`);
-  if (card) renderJobCard(card, job, currentBatch.id);
+  scheduleCardRender(jobId);
 };
 
 // ─── SSE ──────────────────────────────────────────────────────────────────────
@@ -397,14 +465,16 @@ const connectSSE = () => {
     try { data = JSON.parse(msg.data); } catch { return; }
 
     if (data.type === "batch_created") {
-      renderBatch(data.batch);
+      renderBatch(data.batch, true);
     } else if (data.type === "batch_update") {
       renderBatch(data.batch);
     } else if (data.type === "job_update") {
       if (!currentBatch || currentBatch.id !== data.batchId) return;
       const idx = currentBatch.jobs.findIndex((j) => j.id === data.job.id);
-      if (idx >= 0) currentBatch.jobs[idx] = data.job;
-      renderBatch(currentBatch);
+      if (idx >= 0) {
+        currentBatch.jobs[idx] = data.job;
+        scheduleCardRender(data.job.id);
+      }
     } else if (data.type === "job_progress") {
       updateJobInPlace(data.jobId, (j) => {
         j.progress = { ...j.progress, ...data.progress };
@@ -469,6 +539,8 @@ const renderDetail = (job) => {
     <div class="detail-tab-content" data-tab="logs">${renderLogsTab(job)}</div>
   `;
 
+  applyKatex($("#modal-content"));
+
   $("#modal-content .detail-tabs").addEventListener("click", (e) => {
     const btn = e.target.closest("button[data-tab]");
     if (!btn) return;
@@ -476,9 +548,11 @@ const renderDetail = (job) => {
     $$("#modal-content .detail-tab-content").forEach((c) =>
       c.classList.toggle("active", c.dataset.tab === btn.dataset.tab)
     );
+    applyKatex(document.querySelector(`.detail-tab-content[data-tab="${btn.dataset.tab}"]`));
   });
 
   wireQuestionFilter(job);
+  wireDuplicateRows(job);
 };
 
 const renderQuestionsTab = (job) => {
@@ -565,6 +639,19 @@ const wireQuestionFilter = (job) => {
     el.addEventListener("change", renderRows);
   });
   renderRows();
+};
+
+const applyKatex = (el) => {
+  if (typeof renderMathInElement !== "function") return;
+  renderMathInElement(el, {
+    delimiters: [
+      { left: "$$", right: "$$", display: true },
+      { left: "$", right: "$", display: false },
+      { left: "\\(", right: "\\)", display: false },
+      { left: "\\[", right: "\\]", display: true },
+    ],
+    throwOnError: false,
+  });
 };
 
 const renderContentBlocks = (content) => {
@@ -659,6 +746,7 @@ const renderComparison = (rec) => {
   modal.id = "cmp-modal";
   modal.innerHTML = `<div class="modal-body"><button class="modal-close" id="cmp-close">×</button>${html}</div>`;
   document.body.appendChild(modal);
+  applyKatex(modal);
   $("#cmp-close").addEventListener("click", () => {
     modal.remove();
     comparisonState = null;
@@ -716,6 +804,7 @@ const openQuestionModal = async (index) => {
     qModal.id = "q-modal";
     qModal.innerHTML = `<div class="modal-body"><button class="modal-close" id="q-close">×</button>${html}</div>`;
     document.body.appendChild(qModal);
+    applyKatex(qModal);
     $("#q-close").addEventListener("click", () => qModal.remove());
     qModal.addEventListener("click", (e) => { if (e.target === qModal) qModal.remove(); });
   } catch (err) {
@@ -725,12 +814,75 @@ const openQuestionModal = async (index) => {
 
 const renderDuplicatesTab = (job) => {
   if (!job.duplicates.length) return '<div class="empty">No duplicates were skipped.</div>';
+  const hasDetail = job.duplicates.some((d) => d.duplicate_data);
   return `<table class="q-table">
-    <thead><tr><th>#</th><th>Source ID</th><th>Text preview</th></tr></thead>
+    <thead><tr><th>#</th><th>Source ID</th><th>Text preview</th>${hasDetail ? "<th></th>" : ""}</tr></thead>
     <tbody>${job.duplicates.map((d, i) =>
-      `<tr><td>${i + 1}</td><td>${esc(d.id || "—")}</td><td>${esc(d.fingerprint_preview)}</td></tr>`
+      `<tr data-dup-idx="${i}" style="cursor:${d.duplicate_data ? "pointer" : "default"}">
+        <td>${i + 1}</td><td>${esc(d.id || "—")}</td><td>${esc(d.fingerprint_preview)}</td>
+        ${d.duplicate_data ? '<td style="color:var(--muted);font-size:11px">view ›</td>' : (hasDetail ? "<td></td>" : "")}
+      </tr>`
     ).join("")}</tbody>
   </table>`;
+};
+
+const openDuplicateModal = (d, i) => {
+  const existing = document.getElementById("dup-modal");
+  if (existing) existing.remove();
+
+  const renderQData = (data) => {
+    if (!data) return '<div style="color:var(--muted);padding:12px">(no data available)</div>';
+    const optionsHtml = data.options && data.options.length
+      ? `<div class="view-block"><h4>Options</h4><div class="options-list">
+          ${data.options.map((opt, j) => `
+            <div class="option-row ${j === data.correct_option_index ? "correct" : ""}">
+              <div class="option-label">${String.fromCharCode(65 + j)}.</div>
+              <div>${renderContentBlocks(opt)}</div>
+            </div>`).join("")}
+        </div></div>`
+      : "";
+    return `
+      <div class="view-block"><h4>Question</h4>${renderContentBlocks(data.question)}</div>
+      ${optionsHtml}
+      <div class="view-block"><h4>Answer</h4>${renderContentBlocks(data.answer)}</div>
+      <div class="view-block"><h4>Explanation</h4>${renderContentBlocks(data.explanation)}</div>
+    `;
+  };
+
+  const html = `
+    <h3>Duplicate #${i + 1} — Source ID: ${esc(d.id || "—")}</h3>
+    <div class="diff-grid" style="align-items:start">
+      <div class="diff-col">
+        <div class="diff-col-title">Duplicate (skipped)</div>
+        <div class="diff-col-body">${renderQData(d.duplicate_data)}</div>
+      </div>
+      <div class="diff-col">
+        <div class="diff-col-title">Original (kept)</div>
+        <div class="diff-col-body">${renderQData(d.original_data)}</div>
+      </div>
+    </div>
+  `;
+
+  const modal = document.createElement("div");
+  modal.className = "modal";
+  modal.id = "dup-modal";
+  modal.innerHTML = `<div class="modal-body"><button class="modal-close" id="dup-close">×</button>${html}</div>`;
+  document.body.appendChild(modal);
+  applyKatex(modal);
+  document.getElementById("dup-close").addEventListener("click", () => modal.remove());
+  modal.addEventListener("click", (e) => { if (e.target === modal) modal.remove(); });
+};
+
+const wireDuplicateRows = (job) => {
+  const tab = document.querySelector('.detail-tab-content[data-tab="duplicates"]');
+  if (!tab) return;
+  tab.querySelectorAll("tr[data-dup-idx]").forEach((tr) => {
+    const idx = parseInt(tr.dataset.dupIdx, 10);
+    const d = job.duplicates[idx];
+    if (d && d.duplicate_data) {
+      tr.addEventListener("click", () => openDuplicateModal(d, idx));
+    }
+  });
 };
 
 const renderImgErrTab = (job) => {
@@ -754,7 +906,218 @@ const renderAiErrTab = (job) => {
 };
 
 const renderLogsTab = (job) =>
-  `<div class="logs" style="max-height:55vh;">${(job.logs || []).map((l) => `<div>${esc(l)}</div>`).join("")}</div>`;
+  `<div class="logs" style="max-height:55vh;">${[...(job.logs || [])].reverse().map((l) => `<div>${esc(l)}</div>`).join("")}</div>`;
+
+// ─── JSON ANALYZE ─────────────────────────────────────────────────────────────
+let analyzedData = null;
+
+const analyzeQuestions = (questions) => {
+  const byType = {};
+  const byTag = {};
+  let withImages = 0, aiEnhanced = 0, missingAnswer = 0, missingExplanation = 0;
+
+  for (const q of questions) {
+    const slug = q.question_type_slug || q.question_type || "unknown";
+    byType[slug] = (byType[slug] || 0) + 1;
+    for (const tag of (q.tags || [])) byTag[tag] = (byTag[tag] || 0) + 1;
+    if (q.has_question_image || q.has_answer_image || q.has_explanation_image) withImages++;
+    if (q.ai_enhanced_answer || q.ai_enhanced_explanation) aiEnhanced++;
+    const hasAnswer = Array.isArray(q.answer)
+      ? q.answer.some((x) => x.type === "text" && x.value && x.value.trim())
+      : !!q.answer;
+    const hasExpl = Array.isArray(q.explanation)
+      ? q.explanation.some((x) => x.type === "text" && x.value && x.value.trim())
+      : !!q.explanation;
+    if (!hasAnswer) missingAnswer++;
+    if (!hasExpl) missingExplanation++;
+  }
+
+  return { total: questions.length, byType, byTag, withImages, aiEnhanced, missingAnswer, missingExplanation };
+};
+
+const openAnalysisModal = (questions, filename) => {
+  analyzedData = questions;
+  const s = analyzeQuestions(questions);
+
+  const typeRows = Object.entries(s.byType)
+    .sort((a, b) => b[1] - a[1])
+    .map(([t, n]) => `<tr>
+      <td>${esc(t)}</td><td style="font-variant-numeric:tabular-nums">${n}</td>
+      <td><div class="mini-bar"><div style="width:${Math.round((n / s.total) * 100)}%"></div></div></td>
+    </tr>`)
+    .join("");
+
+  const tagRows = Object.entries(s.byTag)
+    .sort((a, b) => b[1] - a[1])
+    .map(([t, n]) => `<tr>
+      <td>${esc(t)}</td><td style="font-variant-numeric:tabular-nums">${n}</td>
+      <td><div class="mini-bar"><div style="width:${Math.round((n / s.total) * 100)}%"></div></div></td>
+    </tr>`)
+    .join("");
+
+  const typeOptions = Object.keys(s.byType).map((t) => `<option value="${esc(t)}">${esc(t)}</option>`).join("");
+  const tagOptions = Object.keys(s.byTag).map((t) => `<option value="${esc(t)}">${esc(t)}</option>`).join("");
+
+  const qTableHTML = `
+    <div class="filter-row">
+      <input id="aq-search" placeholder="Search preview…" style="min-width:220px" />
+      <select id="aq-type"><option value="">All types</option>${typeOptions}</select>
+      <select id="aq-tag"><option value="">All tags</option>${tagOptions}</select>
+      <label style="flex-direction:row;color:var(--text);font-size:11px;align-items:center;gap:4px">
+        <input type="checkbox" id="aq-imgonly" /> has images
+      </label>
+    </div>
+    <div style="max-height:45vh;overflow:auto;">
+      <table class="q-table" id="aq-table">
+        <thead><tr><th>#</th><th>Type</th><th>Preview</th><th>Topic</th><th>Tags</th><th>IMG</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>`;
+
+  $("#modal-content").innerHTML = `
+    <h3>Analysis — <span style="color:var(--muted);font-weight:500">${esc(filename)}</span></h3>
+    <div class="stats-row">
+      <div class="stat ok"><strong>${s.total}</strong> questions</div>
+      <div class="stat"><strong>${s.withImages}</strong> with images</div>
+      <div class="stat ok"><strong>${s.aiEnhanced}</strong> AI enhanced</div>
+      <div class="stat err"><strong>${s.missingAnswer}</strong> no answer</div>
+      <div class="stat warn"><strong>${s.missingExplanation}</strong> no explanation</div>
+    </div>
+    <div class="detail-tabs">
+      <button data-tab="questions" class="active">Questions (${s.total})</button>
+      <button data-tab="types">By Type (${Object.keys(s.byType).length})</button>
+      <button data-tab="tags">By Tag (${Object.keys(s.byTag).length})</button>
+    </div>
+    <div class="detail-tab-content active" data-tab="questions">${qTableHTML}</div>
+    <div class="detail-tab-content" data-tab="types">
+      <div style="max-height:55vh;overflow:auto;">
+        <table class="q-table">
+          <thead><tr><th>Type</th><th>Count</th><th style="width:120px">Share</th></tr></thead>
+          <tbody>${typeRows || '<tr><td colspan="3" style="color:var(--muted)">No type data</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>
+    <div class="detail-tab-content" data-tab="tags">
+      <div style="max-height:55vh;overflow:auto;">
+        <table class="q-table">
+          <thead><tr><th>Tag</th><th>Count</th><th style="width:120px">Share</th></tr></thead>
+          <tbody>${tagRows || '<tr><td colspan="3" style="color:var(--muted)">No tags found</td></tr>'}</tbody>
+        </table>
+      </div>
+    </div>
+  `;
+
+  $("#modal-content .detail-tabs").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-tab]");
+    if (!btn) return;
+    $$("#modal-content .detail-tabs button").forEach((b) => b.classList.toggle("active", b === btn));
+    $$("#modal-content .detail-tab-content").forEach((c) =>
+      c.classList.toggle("active", c.dataset.tab === btn.dataset.tab)
+    );
+  });
+
+  wireAnalysisFilter(questions);
+  $("#modal").classList.remove("hidden");
+};
+
+const wireAnalysisFilter = (questions) => {
+  const renderRows = () => {
+    const search = $("#aq-search").value.trim().toLowerCase();
+    const type = $("#aq-type").value;
+    const tag = $("#aq-tag").value;
+    const imgOnly = $("#aq-imgonly").checked;
+
+    const filtered = questions.filter((q) => {
+      const slug = q.question_type_slug || q.question_type || "unknown";
+      if (search) {
+        const hay = contentPreview(q.question, 300) + " " + contentPreview(q.answer, 100);
+        if (!hay.toLowerCase().includes(search)) return false;
+      }
+      if (type && slug !== type) return false;
+      if (tag && !(q.tags || []).includes(tag)) return false;
+      if (imgOnly && !q.has_question_image && !q.has_answer_image && !q.has_explanation_image) return false;
+      return true;
+    });
+
+    const tbody = $("#aq-table tbody");
+    tbody.innerHTML = filtered
+      .map((q) => {
+        const idx = questions.indexOf(q);
+        const slug = q.question_type_slug || q.question_type || "unknown";
+        const typeBadge = q.is_mcq
+          ? '<span class="badge mcq">MCQ</span>'
+          : q.is_cq
+          ? '<span class="badge cq">CQ</span>'
+          : `<span class="badge">${esc(slug)}</span>`;
+        const imgBadge = q.has_question_image || q.has_answer_image || q.has_explanation_image
+          ? '<span class="badge img">IMG</span>'
+          : "";
+        const tags = (q.tags || []).map((t) => `<span class="badge">${esc(t)}</span>`).join("");
+        return `<tr data-idx="${idx}" style="cursor:pointer">
+          <td>${idx + 1}</td>
+          <td>${typeBadge}</td>
+          <td class="q-preview">${esc(contentPreview(q.question, 120))}</td>
+          <td>${esc(q.topic || "")}</td>
+          <td>${tags}</td>
+          <td>${imgBadge}</td>
+        </tr>`;
+      })
+      .join("");
+
+    tbody.querySelectorAll("tr").forEach((tr) =>
+      tr.addEventListener("click", () => openAnalysisQuestion(parseInt(tr.dataset.idx, 10)))
+    );
+  };
+
+  ["aq-search", "aq-type", "aq-tag", "aq-imgonly"].forEach((id) => {
+    const el = $(`#${id}`);
+    if (el) { el.addEventListener("input", renderRows); el.addEventListener("change", renderRows); }
+  });
+  renderRows();
+};
+
+const openAnalysisQuestion = (idx) => {
+  if (!analyzedData || !analyzedData[idx]) return;
+  const q = analyzedData[idx];
+  const slug = q.question_type_slug || q.question_type || "unknown";
+  const tags = (q.tags || []).map((t) => `<span class="badge">${esc(t)}</span>`).join(" ");
+
+  const optionsHtml = q.options && q.options.length
+    ? `<div class="view-block">
+        <h4>Options</h4>
+        <div class="options-list">
+          ${q.options.map((opt, i) => `
+            <div class="option-row ${i === q.correct_option_index ? "correct" : ""}">
+              <div class="option-label">${String.fromCharCode(65 + i)}.</div>
+              <div>${renderContentBlocks(opt)}</div>
+            </div>`).join("")}
+        </div>
+      </div>`
+    : "";
+
+  const html = `
+    <h3>Question ${idx + 1} — ${esc(slug)} ${tags}</h3>
+    <div class="view-block"><h4>Question</h4>${renderContentBlocks(q.question)}</div>
+    ${optionsHtml}
+    <div class="view-block"><h4>Answer</h4>${renderContentBlocks(q.answer)}</div>
+    <div class="view-block"><h4>Explanation</h4>${renderContentBlocks(q.explanation)}</div>
+    <details>
+      <summary style="cursor:pointer;color:var(--muted);font-size:11px">Raw JSON</summary>
+      <pre class="json-view">${esc(JSON.stringify(q, null, 2))}</pre>
+    </details>
+  `;
+
+  const existing = document.getElementById("aq-modal");
+  if (existing) existing.remove();
+  const modal = document.createElement("div");
+  modal.className = "modal";
+  modal.id = "aq-modal";
+  modal.innerHTML = `<div class="modal-body"><button class="modal-close" id="aq-close">×</button>${html}</div>`;
+  document.body.appendChild(modal);
+  applyKatex(modal);
+  document.getElementById("aq-close").addEventListener("click", () => modal.remove());
+  modal.addEventListener("click", (e) => { if (e.target === modal) modal.remove(); });
+};
 
 // ─── INIT ─────────────────────────────────────────────────────────────────────
 document.addEventListener("DOMContentLoaded", () => {
@@ -789,4 +1152,30 @@ document.addEventListener("DOMContentLoaded", () => {
 
   loadEnvStatus();
   connectSSE();
+
+  // Analyze JSON
+  const analyzeFile = document.getElementById("analyze-file");
+  const analyzeBtn = document.getElementById("analyze-btn");
+  const analyzeFilename = document.getElementById("analyze-filename");
+  analyzeFile.addEventListener("change", () => {
+    const file = analyzeFile.files[0];
+    analyzeFilename.textContent = file ? file.name : "";
+    analyzeBtn.disabled = !file;
+  });
+  analyzeBtn.addEventListener("click", () => {
+    const file = analyzeFile.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const json = JSON.parse(e.target.result);
+        const questions = Array.isArray(json) ? json : (json.questions || json.data || []);
+        if (!Array.isArray(questions) || !questions.length) throw new Error("No questions array found in JSON");
+        openAnalysisModal(questions, file.name);
+      } catch (err) {
+        alert("Invalid JSON: " + err.message);
+      }
+    };
+    reader.readAsText(file);
+  });
 });

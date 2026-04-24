@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Question Downloader</title>
     <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css" />
   </head>
   <body>
     <header class="topbar">
@@ -17,8 +18,8 @@
       <section class="panel">
         <h2>Queue</h2>
         <p class="hint">
-          Add one row per link. Each link saves to <code>CLASS/SUBJECT/CHAPTER N.json</code> (relative
-          to the project root). Defaults on the right pre-fill new rows.
+          Add one row per link. Each link saves to your <code>Downloads/CLASS/SUBJECT/paper-N/CHAPTER N.json</code>.
+          Defaults on the right pre-fill new rows.
         </p>
 
         <div class="defaults-card">
@@ -64,6 +65,14 @@
           <button id="start-batch" class="primary">Start batch</button>
           <button id="cancel-batch" class="danger" disabled>Cancel</button>
           <span id="batch-status" class="batch-status"></span>
+        </div>
+
+        <div class="analyze-sep">Analyze JSON</div>
+        <div class="analyze-row">
+          <label class="analyze-file-btn" for="analyze-file">Choose file</label>
+          <input type="file" id="analyze-file" accept=".json" style="display:none" />
+          <span id="analyze-filename" class="hint" style="margin:0;flex:1;align-self:center;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+          <button id="analyze-btn" disabled>Analyze</button>
         </div>
       </section>
 
@@ -112,6 +121,8 @@
       </tr>
     </template>
 
+    <script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/contrib/auto-render.min.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>

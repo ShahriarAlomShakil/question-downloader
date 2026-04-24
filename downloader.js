@@ -14,6 +14,7 @@ const qFingerprint = (q) =>
     .filter(Boolean)
     .join("|");
 
+
 // ─── CONTENT EXTRACTION ───────────────────────────────────────────────────────
 const extractContent = (richText) => {
   if (typeof richText === "string") {
@@ -69,6 +70,16 @@ const extractContent = (richText) => {
   return content;
 };
 
+const extractRawPreview = (q) => ({
+  source_id: q.id || null,
+  question_type: q.question_type?.name || "",
+  question: extractContent(q.question_text),
+  answer: extractContent(q.answer_text),
+  explanation: extractContent(q.explanation_text),
+  options: (q.option || []).map((o) => extractContent(o)),
+  correct_option_index: q.mcq_solution_index ?? null,
+});
+
 const richHasText = (richText) => {
   if (!richText) return false;
   if (typeof richText === "string") return richText.trim().length > 0;
@@ -79,6 +90,16 @@ const richHasText = (richText) => {
 const richHasImage = (richText) => {
   if (!richText?.entityMap) return false;
   return Object.values(richText.entityMap).some((e) => e.type === "IMAGE");
+};
+
+// Answer+Explanation=3, Answer=2, Explanation=1, None=0
+const qPriority = (q) => {
+  const hasAnswer = richHasText(q.answer_text);
+  const hasExpl = richHasText(q.explanation_text);
+  if (hasAnswer && hasExpl) return 3;
+  if (hasAnswer) return 2;
+  if (hasExpl) return 1;
+  return 0;
 };
 
 const contentToText = (content) => {
@@ -194,6 +215,8 @@ class JobRunner extends EventEmitter {
     this.uploadCache = new Map();
     this.seenIds = new Set();
     this.seenTexts = new Set();
+    this.seenIdMap = new Map();
+    this.seenFpMap = new Map();
   }
 
   log(msg) {
@@ -479,13 +502,39 @@ ${text}`;
       for (const q of questions) {
         const id = q.id;
         const fp = qFingerprint(q);
-        if ((id && this.seenIds.has(id)) || (fp && this.seenTexts.has(fp))) {
+        const isDup = (id && this.seenIds.has(id)) || (fp && this.seenTexts.has(fp));
+
+        if (isDup) {
           dupes++;
-          this.duplicates.push({ id: id || null, fingerprint_preview: (fp || "").slice(0, 100) });
+          const existingQ = (id && this.seenIdMap.get(id)) || (fp && this.seenFpMap.get(fp)) || null;
+          const incomingPri = qPriority(q);
+          const existingPri = existingQ ? qPriority(existingQ) : -1;
+
+          if (incomingPri > existingPri && existingQ) {
+            // Incoming is better — replace existing in questionsRaw
+            const rawIdx = this.questionsRaw.indexOf(existingQ);
+            if (rawIdx !== -1) this.questionsRaw[rawIdx] = q;
+            if (id) this.seenIdMap.set(id, q);
+            if (fp) this.seenFpMap.set(fp, q);
+            this.duplicates.push({
+              id: existingQ.id || null,
+              fingerprint_preview: (qFingerprint(existingQ) || "").slice(0, 100),
+              duplicate_data: extractRawPreview(existingQ),
+              original_data: extractRawPreview(q),
+            });
+          } else {
+            this.duplicates.push({
+              id: id || null,
+              fingerprint_preview: (fp || "").slice(0, 100),
+              duplicate_data: extractRawPreview(q),
+              original_data: existingQ ? extractRawPreview(existingQ) : null,
+            });
+          }
           continue;
         }
-        if (id) this.seenIds.add(id);
-        if (fp) this.seenTexts.add(fp);
+
+        if (id) { this.seenIds.add(id); this.seenIdMap.set(id, q); }
+        if (fp) { this.seenTexts.add(fp); this.seenFpMap.set(fp, q); }
         this.questionsRaw.push(q);
       }
 
@@ -620,7 +669,8 @@ ${text}`;
     }
 
     // Phase 4: write file
-    const dirPath = path.join(this.outputRoot, meta.class, meta.subject);
+    const paper = parseInt(meta.paper, 10) || 1;
+    const dirPath = path.join(this.outputRoot, meta.class, meta.subject, `paper-${paper}`);
     fs.mkdirSync(dirPath, { recursive: true });
     const outputPath = path.join(dirPath, `CHAPTER ${meta.chapter_no}.json`);
 
